@@ -1,0 +1,6 @@
+.venv/
+dataset/
+pruebasMapas/
+__pycache__/
+*.pyc
+
