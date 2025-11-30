@@ -1,3 +1,4 @@
+import os
 import pandas as pd
 import numpy as np
 
@@ -87,6 +88,10 @@ def add_time_features(daily_full, max_lag=7):
 
     df = df.dropna(subset=['lag1']).copy()
 
+    df['lag2'] = df['lag2'].fillna(0)
+    df['lag7'] = df['lag7'].fillna(0)
+    df['roll7'] = df['roll7'].fillna(0)
+
     base = df[['date', 'crime_category', 'cell_x', 'cell_y', 'lag1']].copy()
 
     frames = []
@@ -113,6 +118,8 @@ def add_time_features(daily_full, max_lag=7):
         how='left'
     )
     df['lag1_neigh'] = df['lag1_neigh'].fillna(0)
+
+    df = df.replace([np.inf, -np.inf], np.nan).dropna().copy()
 
     return df
 
@@ -148,18 +155,14 @@ class CrimeMLP(nn.Module):
 
 
 class TorchRegressorWrapper:
-    """
-    Wrapper para que el modelo de PyTorch tenga .predict(X)
-    como un modelo de sklearn/xgboost.
-    """
-
-    def __init__(self, net, device):
+    def __init__(self, net, device, feature_cols):
         self.net = net
         self.device = device
+        self.feature_cols = feature_cols
 
     def predict(self, X_df):
         self.net.eval()
-        X = X_df.values.astype(np.float32)
+        X = X_df[self.feature_cols].values.astype(np.float32)
         with torch.no_grad():
             X_t = torch.from_numpy(X).to(self.device)
             y_pred = self.net(X_t).cpu().numpy().ravel()
@@ -236,12 +239,18 @@ def train_pytorch_model(df_features, test_days=60,
     print(f"MAE  : {mae:.3f}")
     print(f"RMSE : {rmse:.3f}")
 
-    wrapper = TorchRegressorWrapper(net, device)
+    # Guardar modelo en ./modelos
+    os.makedirs("./modelos", exist_ok=True)
+    model_path = "./modelos/modelo_mlp_crimen.pt"
+    torch.save(net.state_dict(), model_path)
+    print(f"Modelo PyTorch guardado en {model_path}")
+
+    wrapper = TorchRegressorWrapper(net, device, feature_cols)
     return wrapper, feature_cols, df_features
 
 
 # ----------------------------------------------------------
-# 7) Predicción día siguiente (reutilizamos la lógica)
+# 7) Predicción día siguiente
 # ----------------------------------------------------------
 def predict_next_day(model, feature_cols, df_features):
     df = df_features.sort_values(['cell_id', 'crime_category', 'date']).copy()
@@ -321,8 +330,7 @@ def predict_next_day(model, feature_cols, df_features):
 
     next_df = pd.DataFrame(rows)
 
-    X_next = next_df[feature_cols]
-    next_df['pred_count'] = model.predict(X_next)
+    next_df['pred_count'] = model.predict(next_df)
 
     return next_df
 
@@ -344,11 +352,10 @@ def main():
     df_feat = add_time_features(daily_full)
     print("Shape df_feat:", df_feat.shape)
 
-    # Entrenar modelo PyTorch (GPU si hay)
     model, feature_cols, df_feat_trained = train_pytorch_model(
         df_feat,
         test_days=60,
-        epochs=5,
+        epochs=25,
         batch_size=4096,
         lr=1e-3
     )
@@ -357,10 +364,10 @@ def main():
     print("\nEjemplo de predicción para el día siguiente:")
     print(next_day_pred.head(20))
 
-    next_day_pred.to_csv(
-        "./dataset/predicciones_siguiente_dia_pytorch.csv", index=False
-    )
-    print("\nPredicciones guardadas en ./dataset/predicciones_siguiente_dia_pytorch.csv")
+    os.makedirs("./dataset", exist_ok=True)
+    out_path = "./dataset/predicciones_siguiente_dia_pytorch.csv"
+    next_day_pred.to_csv(out_path, index=False)
+    print(f"\nPredicciones guardadas en {out_path}")
 
 
 if __name__ == "__main__":

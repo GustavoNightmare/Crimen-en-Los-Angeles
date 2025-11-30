@@ -1,3 +1,4 @@
+import os
 import pandas as pd
 import numpy as np
 
@@ -10,7 +11,6 @@ from xgboost import XGBRegressor
 # ----------------------------------------------------------
 def load_data(path_csv="./dataset/dataset_procesado.csv"):
     df = pd.read_csv(path_csv, parse_dates=['DATE OCC'])
-    # Solo necesitamos fecha (sin hora) para este modelo diario
     df['date'] = df['DATE OCC'].dt.normalize()
     return df
 
@@ -19,20 +19,12 @@ def load_data(path_csv="./dataset/dataset_procesado.csv"):
 # 2) Crear cuadrícula espacial (celdas)
 # ----------------------------------------------------------
 def add_grid_cells(df, cell_size_lat=0.02, cell_size_lon=0.02):
-    """
-    cell_size_lat/lon ~ tamaño de celda en grados.
-    0.02 es aprox ~2 km, puedes afinarlo luego.
-    """
     lat_min, lat_max = df['LAT'].min(), df['LAT'].max()
     lon_min, lon_max = df['LON'].min(), df['LON'].max()
 
-    # indice entero de la celda
     df['cell_y'] = ((df['LAT'] - lat_min) / cell_size_lat).astype(int)
     df['cell_x'] = ((df['LON'] - lon_min) / cell_size_lon).astype(int)
-
-    # id único por celda (número)
-    df['cell_id'] = df['cell_y'] * 10_000 + \
-        df['cell_x']   # truco para combinarlos
+    df['cell_id'] = df['cell_y'] * 10_000 + df['cell_x']
 
     return df, (lat_min, lon_min, cell_size_lat, cell_size_lon)
 
@@ -50,12 +42,6 @@ def build_daily_counts(df):
 
 
 def make_full_grid(daily):
-    """
-    Creamos todas las combinaciones date x cell_id x category
-    y rellenamos faltantes con 0.
-    OJO: si la cuadrícula es muy fina esto se puede poner pesado:
-    puedes subir el cell_size_lat/lon para reducir número de celdas.
-    """
     all_dates = pd.date_range(daily['date'].min(),
                               daily['date'].max(),
                               freq='D')
@@ -84,7 +70,7 @@ def add_time_features(daily_full, max_lag=7):
 
     g = df.groupby(['cell_id', 'crime_category'], group_keys=False)
 
-    # Lags simples
+    # Lags
     df['lag1'] = g['count'].shift(1)
     df['lag2'] = g['count'].shift(2)
     df['lag7'] = g['count'].shift(7)
@@ -93,18 +79,22 @@ def add_time_features(daily_full, max_lag=7):
     df['roll7'] = g['count'].shift(1).rolling(window=7, min_periods=1).mean()
 
     # Calendario
-    df['dow'] = df['date'].dt.dayofweek  # 0=lunes
+    df['dow'] = df['date'].dt.dayofweek
     df['month'] = df['date'].dt.month
 
-    # Coordenadas de la celda a partir del cell_id
+    # Coordenadas de celda
     df['cell_x'] = df['cell_id'] % 10000
     df['cell_y'] = df['cell_id'] // 10000
 
-    # Quitamos filas sin lag1 (principio de cada serie)
+    # Al menos tener lag1 (si no, no hay historial)
     df = df.dropna(subset=['lag1']).copy()
 
-    # --------- NUEVO: feature de "crimen en celdas vecinas ayer" ---------
-    # Usamos lag1 (crímenes de ayer) y lo sumamos en un vecindario 3x3
+    # Rellenar lags/roll para que NO queden NaNs
+    df['lag2'] = df['lag2'].fillna(0)
+    df['lag7'] = df['lag7'].fillna(0)
+    df['roll7'] = df['roll7'].fillna(0)
+
+    # --------- vecinos (3x3) usando lag1 (ayer) ---------
     base = df[['date', 'crime_category', 'cell_x', 'cell_y', 'lag1']].copy()
 
     frames = []
@@ -132,11 +122,14 @@ def add_time_features(daily_full, max_lag=7):
     )
     df['lag1_neigh'] = df['lag1_neigh'].fillna(0)
 
+    # Seguridad extra: quitar cualquier NaN/inf residual
+    df = df.replace([np.inf, -np.inf], np.nan).dropna().copy()
+
     return df
 
 
 # ----------------------------------------------------------
-# 5) Train / test split temporal + entrenamiento XGBoost GPU
+# 5) Train / test split temporal + entrenamiento XGBoost
 # ----------------------------------------------------------
 def train_xgboost_gpu(df_features, test_days=60):
     df_features = df_features.sort_values('date')
@@ -159,28 +152,19 @@ def train_xgboost_gpu(df_features, test_days=60):
     X_test = test[feature_cols]
     y_test = test['count']
 
-    # Modelo XGBoost usando GPU
-    # Si te da error con "device", prueba:
-    #   - actualizar xgboost: pip install -U xgboost
-    #   - o cambiar device="cuda" por tree_method="gpu_hist"
+    # Esta build de XGBoost no tiene GPU, así que usamos "hist" en CPU.
     model = XGBRegressor(
         n_estimators=400,
         max_depth=8,
         learning_rate=0.05,
         subsample=0.8,
         colsample_bytree=0.8,
-        tree_method="hist",   # junto con device="cuda" usa GPU
-        device="cuda",        # <- aquí le dices "usa la GPU"
+        tree_method="hist",      # hist en CPU
         n_jobs=-1,
         random_state=42,
     )
 
-    model.fit(
-        X_train, y_train,
-        eval_set=[(X_test, y_test)],
-        eval_metric="rmse",
-        verbose=False,
-    )
+    model.fit(X_train, y_train)
 
     pred_test = model.predict(X_test)
 
@@ -188,16 +172,21 @@ def train_xgboost_gpu(df_features, test_days=60):
     mse = mean_squared_error(y_test, pred_test)
     rmse = np.sqrt(mse)
 
-    print("Evaluación XGBoost GPU (últimos días como test):")
+    print("Evaluación XGBoost (últimos días como test):")
     print(f"MAE  : {mae:.3f}")
     print(f"RMSE : {rmse:.3f}")
+
+    # Guardar modelo en ./modelos
+    os.makedirs("./modelos", exist_ok=True)
+    model_path = "./modelos/modelo_xgboost_crimen.json"
+    model.save_model(model_path)
+    print(f"Modelo XGBoost guardado en {model_path}")
 
     return model, feature_cols, df_features
 
 
 # ----------------------------------------------------------
-# 6) Predecir el día siguiente para TODAS las celdas/categorías
-#    (incluyendo vecinos)
+# 6) Predicción del día siguiente
 # ----------------------------------------------------------
 def predict_next_day(model, feature_cols, df_features):
     df = df_features.sort_values(['cell_id', 'crime_category', 'date']).copy()
@@ -205,7 +194,6 @@ def predict_next_day(model, feature_cols, df_features):
     last_date = df['date'].max()
     next_date = last_date + pd.Timedelta(days=1)
 
-    # Calculamos lag1_neigh para el último día disponible
     last_mask = df['date'] == last_date
     last_day = df.loc[last_mask, ['cell_id', 'crime_category',
                                   'cell_x', 'cell_y', 'count']].copy()
@@ -237,20 +225,17 @@ def predict_next_day(model, feature_cols, df_features):
     )
     last_day['lag1_neigh'] = last_day['lag1_neigh'].fillna(0)
 
-    # Diccionario (cell_id, categoria) -> lag1_neigh
     neigh_map = {
         (row.cell_id, row.crime_category): row.lag1_neigh
         for row in last_day.itertuples()
     }
 
-    # Construimos las features para el día siguiente
     rows = []
     for (cell, cat), g in df.groupby(['cell_id', 'crime_category']):
         g = g.sort_values('date')
 
         last = g.iloc[-1]
 
-        # crímenes ayer en esta celda
         lag1 = last['count']
         lag2 = g['count'].iloc[-2] if len(g) >= 2 else 0
         lag7 = g['count'].iloc[-7] if len(g) >= 7 else 0
@@ -262,7 +247,7 @@ def predict_next_day(model, feature_cols, df_features):
         cell_x = cell % 10000
         cell_y = cell // 10000
 
-        lag1_neigh = neigh_map.get((cell, cat), 0.0)  # vecinos ayer
+        lag1_neigh = neigh_map.get((cell, cat), 0.0)
 
         rows.append({
             'date': next_date,
@@ -291,39 +276,31 @@ def predict_next_day(model, feature_cols, df_features):
 # 7) Main
 # ----------------------------------------------------------
 def main():
-    # 1) Cargar
     df = load_data()
 
-    # 2) Cuadrícula
     df, grid_info = add_grid_cells(df, cell_size_lat=0.02, cell_size_lon=0.02)
     print("Grid info (lat_min, lon_min, dlat, dlon):", grid_info)
 
-    # 3) Agregar por día/celda/categoría
     daily = build_daily_counts(df)
 
-    # 3b) Rellenar grid completo con 0
     daily_full = make_full_grid(daily)
     print("Shape daily_full:", daily_full.shape)
 
-    # 4) Features temporales + espaciales
     df_feat = add_time_features(daily_full)
     print("Shape df_feat:", df_feat.shape)
 
-    # 5) Entrenar modelo (XGBoost en GPU)
     model, feature_cols, df_feat_trained = train_xgboost_gpu(
         df_feat, test_days=60
     )
 
-    # 6) Predicción para el día siguiente
     next_day_pred = predict_next_day(model, feature_cols, df_feat_trained)
     print("\nEjemplo de predicción para el día siguiente:")
     print(next_day_pred.head(20))
 
-    # 7) Guardar predicciones
-    next_day_pred.to_csv(
-        "./dataset/predicciones_siguiente_dia_xgb.csv", index=False
-    )
-    print("\nPredicciones guardadas en ./dataset/predicciones_siguiente_dia_xgb.csv")
+    os.makedirs("./dataset", exist_ok=True)
+    out_path = "./dataset/predicciones_siguiente_dia_xgb.csv"
+    next_day_pred.to_csv(out_path, index=False)
+    print(f"\nPredicciones guardadas en {out_path}")
 
 
 if __name__ == "__main__":
