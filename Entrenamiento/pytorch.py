@@ -355,7 +355,7 @@ def main():
     model, feature_cols, df_feat_trained = train_pytorch_model(
         df_feat,
         test_days=60,
-        epochs=25,
+        epochs=50,
         batch_size=4096,
         lr=1e-3
     )
