@@ -398,6 +398,7 @@ def build_heatmap_df(full_pred_df, crime_category, top_percent=0.05):
 
 def save_heatmap_image(df_cat, crime_category, metric="prob_1plus"):
     import matplotlib.pyplot as plt
+    from matplotlib import colors
 
     if df_cat.empty:
         return None
@@ -405,13 +406,24 @@ def save_heatmap_image(df_cat, crime_category, metric="prob_1plus"):
     metric_col = metric
 
     plt.figure(figsize=(8, 6))
+
+    # Escala logarítmica para resaltar diferencias en valores pequeños
+    values = df_cat[metric_col].values
+    # Evitar problemas con ceros: ponemos un mínimo pequeño
+    vmin = max(values[values > 0].min(), 1e-4) if np.any(values > 0) else 1e-4
+    vmax = values.max() if values.max() > vmin else vmin * 10
+    norm = colors.LogNorm(vmin=vmin, vmax=vmax)
+
     sc = plt.scatter(
         df_cat["lon_center"],
         df_cat["lat_center"],
         c=df_cat[metric_col],
         s=12,
-        alpha=0.9
+        alpha=0.9,
+        cmap="inferno",    # <- colormap con mucho contraste
+        norm=norm,         # <- escala logarítmica
     )
+
     plt.colorbar(sc, label=metric_col)
     plt.xlabel("Longitud")
     plt.ylabel("Latitud")
