@@ -9,20 +9,46 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 
+# ----------------------------------------------------------
+# CONFIGURACIÓN PRINCIPAL (AJUSTABLE)
+# ----------------------------------------------------------
+DATA_PATH = "./dataset/dataset_procesado.csv"
+
+# usar solo los últimos N años del dataset para bajar memoria
+USE_LAST_YEARS = 5        # puedes subir/bajar este valor
+
+# tamaño de celda: mientras más grande, menos celdas
+CELL_SIZE_LAT = 0.05
+CELL_SIZE_LON = 0.05
+
+TEST_DAYS = 60
+EPOCHS = 20               # empieza con 20, luego puedes subir
+BATCH_SIZE = 512          # batch pequeño para GPU de poca RAM
+LR = 1e-3
+
 
 # ----------------------------------------------------------
 # 1) Cargar dataset limpio
 # ----------------------------------------------------------
-def load_data(path_csv="./dataset/dataset_procesado.csv"):
+def load_data(path_csv=DATA_PATH, last_years=USE_LAST_YEARS):
     df = pd.read_csv(path_csv, parse_dates=['DATE OCC'])
     df['date'] = df['DATE OCC'].dt.normalize()
+
+    if last_years is not None:
+        max_date = df['date'].max()
+        cutoff = max_date - pd.DateOffset(years=last_years)
+        df = df[df['date'] >= cutoff].copy()
+        print(
+            f"Filtrando a los últimos {last_years} años: {cutoff.date()} -> {max_date.date()}")
+        print("Shape después de filtrar por años:", df.shape)
+
     return df
 
 
 # ----------------------------------------------------------
 # 2) Crear cuadrícula espacial (celdas)
 # ----------------------------------------------------------
-def add_grid_cells(df, cell_size_lat=0.02, cell_size_lon=0.02):
+def add_grid_cells(df, cell_size_lat=CELL_SIZE_LAT, cell_size_lon=CELL_SIZE_LON):
     lat_min, lat_max = df['LAT'].min(), df['LAT'].max()
     lon_min, lon_max = df['LON'].min(), df['LON'].max()
 
@@ -67,7 +93,8 @@ def make_full_grid(daily):
 
 
 # ----------------------------------------------------------
-# 4) Features temporales (lags, medias móviles, calendario, vecinos)
+# 4) Features temporales (lags, medias móviles, calendario)
+#    *SIN* vecinos para ahorrar memoria
 # ----------------------------------------------------------
 def add_time_features(daily_full, max_lag=7):
     df = daily_full.sort_values(['cell_id', 'crime_category', 'date']).copy()
@@ -86,38 +113,15 @@ def add_time_features(daily_full, max_lag=7):
     df['cell_x'] = df['cell_id'] % 10000
     df['cell_y'] = df['cell_id'] // 10000
 
+    # quitamos filas sin lag1 (primeros días)
     df = df.dropna(subset=['lag1']).copy()
 
     df['lag2'] = df['lag2'].fillna(0)
     df['lag7'] = df['lag7'].fillna(0)
     df['roll7'] = df['roll7'].fillna(0)
 
-    base = df[['date', 'crime_category', 'cell_x', 'cell_y', 'lag1']].copy()
-
-    frames = []
-    for dx in [-1, 0, 1]:
-        for dy in [-1, 0, 1]:
-            tmp = base.copy()
-            tmp['cell_x'] += dx
-            tmp['cell_y'] += dy
-            frames.append(tmp)
-
-    neigh_all = pd.concat(frames, ignore_index=True)
-
-    neigh_agg = (
-        neigh_all
-        .groupby(['date', 'crime_category', 'cell_x', 'cell_y'])['lag1']
-        .sum()
-        .reset_index()
-        .rename(columns={'lag1': 'lag1_neigh'})
-    )
-
-    df = df.merge(
-        neigh_agg,
-        on=['date', 'crime_category', 'cell_x', 'cell_y'],
-        how='left'
-    )
-    df['lag1_neigh'] = df['lag1_neigh'].fillna(0)
+    # para ahorrar RAM, NO calculamos vecinos aquí
+    df['lag1_neigh'] = 0.0
 
     df = df.replace([np.inf, -np.inf], np.nan).dropna().copy()
 
@@ -142,12 +146,13 @@ class CrimeDataset(Dataset):
 class CrimeMLP(nn.Module):
     def __init__(self, in_features):
         super().__init__()
+        # red más pequeña para Jetson
         self.net = nn.Sequential(
-            nn.Linear(in_features, 128),
+            nn.Linear(in_features, 64),
             nn.ReLU(),
-            nn.Linear(128, 64),
+            nn.Linear(64, 32),
             nn.ReLU(),
-            nn.Linear(64, 1),
+            nn.Linear(32, 1),
         )
 
     def forward(self, x):
@@ -170,12 +175,17 @@ class TorchRegressorWrapper:
 
 
 # ----------------------------------------------------------
-# 6) Entrenamiento con PyTorch (GPU si hay)
+# 6) Entrenamiento con PyTorch
+#    (intenta usar GPU, cae a CPU si falla)
 # ----------------------------------------------------------
-def train_pytorch_model(df_features, test_days=60,
-                        epochs=5, batch_size=4096, lr=1e-3):
+def train_pytorch_model(df_features, test_days=TEST_DAYS,
+                        epochs=EPOCHS, batch_size=BATCH_SIZE, lr=LR):
+
+    # intentamos usar CUDA
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print("Usando dispositivo:", device)
+    print("Intentando usar dispositivo:", device)
+    if device.type == "cuda":
+        print("GPU detectada:", torch.cuda.get_device_name(0))
 
     df_features = df_features.sort_values('date')
 
@@ -191,51 +201,94 @@ def train_pytorch_model(df_features, test_days=60,
         'cell_x', 'cell_y'
     ]
 
-    X_train = train[feature_cols].values
-    y_train = train['count'].values
+    X_train = train[feature_cols].values.astype(np.float32)
+    y_train = train['count'].values.astype(np.float32)
 
-    X_test = test[feature_cols].values
-    y_test = test['count'].values
+    X_test = test[feature_cols].values.astype(np.float32)
+    y_test = test['count'].values.astype(np.float32)
+
+    print("Tamaño train:", X_train.shape, "Tamaño test:", X_test.shape)
 
     train_dataset = CrimeDataset(X_train, y_train)
-    train_loader = DataLoader(train_dataset,
-                              batch_size=batch_size,
-                              shuffle=True,
-                              num_workers=0)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=0,
+        pin_memory=(device.type == "cuda")
+    )
 
     net = CrimeMLP(in_features=len(feature_cols)).to(device)
     criterion = nn.MSELoss()
     optimizer = optim.Adam(net.parameters(), lr=lr)
 
-    for epoch in range(1, epochs + 1):
-        net.train()
-        running_loss = 0.0
-        for batch_X, batch_y in train_loader:
-            batch_X = batch_X.to(device)
-            batch_y = batch_y.to(device)
+    # mixed precision solo si hay CUDA
+    use_amp = (device.type == "cuda")
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
-            optimizer.zero_grad()
-            outputs = net(batch_X)
-            loss = criterion(outputs, batch_y)
-            loss.backward()
-            optimizer.step()
+    def run_training_loop(current_device):
+        nonlocal net, optimizer, scaler, train_loader
+        print(f"\n*** Entrenando en {current_device} ***")
+        for epoch in range(1, epochs + 1):
+            net.train()
+            running_loss = 0.0
 
-            running_loss += loss.item() * batch_X.size(0)
+            for batch_X, batch_y in train_loader:
+                batch_X = batch_X.to(current_device, non_blocking=True)
+                batch_y = batch_y.to(current_device, non_blocking=True)
 
-        epoch_loss = running_loss / len(train_dataset)
-        print(f"Epoch {epoch}/{epochs} - Train MSE: {epoch_loss:.4f}")
+                optimizer.zero_grad()
+
+                if use_amp:
+                    with torch.cuda.amp.autocast():
+                        outputs = net(batch_X)
+                        loss = criterion(outputs, batch_y)
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    outputs = net(batch_X)
+                    loss = criterion(outputs, batch_y)
+                    loss.backward()
+                    optimizer.step()
+
+                running_loss += loss.item() * batch_X.size(0)
+
+            epoch_loss = running_loss / len(train_dataset)
+            print(f"Epoch {epoch}/{epochs} - Train MSE: {epoch_loss:.4f}")
+
+    try:
+        # intentamos entrenar en el dispositivo elegido (CUDA o CPU)
+        run_training_loop(device)
+    except RuntimeError as e:
+        # si falla por memoria en CUDA, pasamos a CPU
+        msg = str(e)
+        if device.type == "cuda" and (
+            "CUBLAS_STATUS_ALLOC_FAILED" in msg
+            or "out of memory" in msg.lower()
+        ):
+            print("\n[ADVERTENCIA] Falló por memoria en GPU. "
+                  "Cambiando a CPU y reiniciando entrenamiento...\n")
+            torch.cuda.empty_cache()
+            device = torch.device("cpu")
+            net = net.to(device)
+            use_amp = False
+            scaler = torch.cuda.amp.GradScaler(enabled=False)
+            run_training_loop(device)
+        else:
+            raise e
 
     # Evaluar en test
     net.eval()
     with torch.no_grad():
-        X_test_t = torch.from_numpy(X_test.astype(np.float32)).to(device)
+        X_test_t = torch.from_numpy(X_test).to(device)
         y_pred_t = net(X_test_t).cpu().numpy().ravel()
 
     mae = mean_absolute_error(y_test, y_pred_t)
     mse = mean_squared_error(y_test, y_pred_t)
     rmse = np.sqrt(mse)
 
-    print("Evaluación MLP PyTorch (últimos días como test):")
+    print("\nEvaluación MLP PyTorch (últimos días como test):")
     print(f"MAE  : {mae:.3f}")
     print(f"RMSE : {rmse:.3f}")
 
@@ -246,18 +299,19 @@ def train_pytorch_model(df_features, test_days=60,
     print(f"Modelo PyTorch guardado en {model_path}")
 
     wrapper = TorchRegressorWrapper(net, device, feature_cols)
-    return wrapper, feature_cols, df_features
+    return wrapper, feature_cols, df_features, device
 
 
 # ----------------------------------------------------------
 # 7) Predicción día siguiente
 # ----------------------------------------------------------
-def predict_next_day(model, feature_cols, df_features):
+def predict_next_day(model, feature_cols, df_features, device):
     df = df_features.sort_values(['cell_id', 'crime_category', 'date']).copy()
 
     last_date = df['date'].max()
     next_date = last_date + pd.Timedelta(days=1)
 
+    # sub-df del último día (es pequeño, no hay problema de RAM)
     last_mask = df['date'] == last_date
     last_day = df.loc[last_mask, ['cell_id', 'crime_category',
                                   'cell_x', 'cell_y', 'count']].copy()
@@ -330,6 +384,7 @@ def predict_next_day(model, feature_cols, df_features):
 
     next_df = pd.DataFrame(rows)
 
+    # usamos el wrapper (ya maneja device internamente)
     next_df['pred_count'] = model.predict(next_df)
 
     return next_df
@@ -341,7 +396,9 @@ def predict_next_day(model, feature_cols, df_features):
 def main():
     df = load_data()
 
-    df, grid_info = add_grid_cells(df, cell_size_lat=0.02, cell_size_lon=0.02)
+    df, grid_info = add_grid_cells(df,
+                                   cell_size_lat=CELL_SIZE_LAT,
+                                   cell_size_lon=CELL_SIZE_LON)
     print("Grid info (lat_min, lon_min, dlat, dlon):", grid_info)
 
     daily = build_daily_counts(df)
@@ -352,15 +409,16 @@ def main():
     df_feat = add_time_features(daily_full)
     print("Shape df_feat:", df_feat.shape)
 
-    model, feature_cols, df_feat_trained = train_pytorch_model(
+    model, feature_cols, df_feat_trained, device = train_pytorch_model(
         df_feat,
-        test_days=60,
-        epochs=50,
-        batch_size=4096,
-        lr=1e-3
+        test_days=TEST_DAYS,
+        epochs=EPOCHS,
+        batch_size=BATCH_SIZE,
+        lr=LR
     )
 
-    next_day_pred = predict_next_day(model, feature_cols, df_feat_trained)
+    next_day_pred = predict_next_day(
+        model, feature_cols, df_feat_trained, device)
     print("\nEjemplo de predicción para el día siguiente:")
     print(next_day_pred.head(20))
 
